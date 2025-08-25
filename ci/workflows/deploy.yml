@@ -1,0 +1,119 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: sample-app
+  EKS_CLUSTER_NAME: devops-capstone
+  APP_NAME: sample-app
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Run lint & tests
+        run: |
+          pip install flake8 pytest
+          flake8 app/src
+          pytest app/src
+
+  docker-build-push:
+    runs-on: ubuntu-latest
+    needs: lint-test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG ./app
+          docker tag $ECR_REPOSITORY:$IMAGE_TAG ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+  terraform:
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply (requires approval)
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve tfplan
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: terraform
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --region $AWS_REGION --name $EKS_CLUSTER_NAME
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Deploy with Helm
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          helm upgrade --install $APP_NAME ./platform/charts/sample-app \
+            --namespace app --create-namespace \
+            --set image.repository=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY \
+            --set image.tag=$IMAGE_TAG
+
